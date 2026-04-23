@@ -265,10 +265,12 @@ class InterpolativeSeparableDensityFitting(FFTDF):
 
         self._coul_kpt = None
         self._inpv_kpt = None
-        self._eta_kpt = None
-        self._metx_kpt = None
-        self._kern_kpt = None
+        self._base_inpv_kpt = None
+        self._base_eta_kpt = None
+        self._base_metx_kpt = None
+        self._base_kern_kpt = None
         self.reg = 0.0
+        self.c = None
         self.ov = ov
 
     get_eri = isdf_ao2mo.get_ao_eri
@@ -429,12 +431,18 @@ class InterpolativeSeparableDensityFitting(FFTDF):
 
         return kern_kpt
 
-    def solve_coul_kpt(self, metx_kpt, kern_kpt, reg=0.0):
+    def solve_coul_kpt(self, metx_kpt, kern_kpt, reg=0.0, c=None):
         log = logger.new_logger(self, self.verbose)
         tol = self.tol
 
         nkpt, nip = metx_kpt.shape[:2]
         coul_kpt = numpy.zeros((nkpt, nip, nip), dtype=numpy.complex128)
+        if c is not None:
+            c = numpy.asarray(c)
+            assert c.shape == (nip,)
+            d = c * c
+        else:
+            d = None
 
         log.debug("\nSolving coul_kpt")
         info = (lambda s: f"coul_kpt[ %{len(s)}d / {s}]")(str(nkpt))
@@ -443,6 +451,9 @@ class InterpolativeSeparableDensityFitting(FFTDF):
 
             metx_q = metx_kpt[q]
             kern_q = kern_kpt[q]
+            if d is not None:
+                metx_q = d[:, None] * metx_q * d[None, :]
+                kern_q = d[:, None] * kern_q * d[None, :]
             res = lstsq(metx_q, kern_q, tol=tol, reg=reg)
             coul_q = res[0]
             coul_q = (coul_q + coul_q.conj().T) / 2
@@ -450,7 +461,7 @@ class InterpolativeSeparableDensityFitting(FFTDF):
                 err = metx_q @ coul_q @ metx_q - kern_q
                 err = abs(err).max() / abs(kern_q).max()
                 log.debug("\nMetric tensor rank: %d / %d, lstsq error: %6.2e", res[1], nip, err)
-                
+
             coul_kpt[q] = coul_q
             coul_q = None
 
@@ -458,12 +469,12 @@ class InterpolativeSeparableDensityFitting(FFTDF):
 
         return coul_kpt
 
-    def build_coul_kpt(self, inpv_kpt, eta_kpt, reg=0.0):
+    def build_coul_kpt(self, inpv_kpt, eta_kpt, reg=0.0, c=None):
         metx_kpt = self.build_metx_kpt(inpv_kpt)
         kern_kpt = self.build_kern_kpt(inpv_kpt, eta_kpt)
-        coul_kpt = self.solve_coul_kpt(metx_kpt, kern_kpt, reg=reg)
-        self._metx_kpt = metx_kpt
-        self._kern_kpt = kern_kpt
+        coul_kpt = self.solve_coul_kpt(metx_kpt, kern_kpt, reg=reg, c=c)
+        self._base_metx_kpt = metx_kpt
+        self._base_kern_kpt = kern_kpt
         return coul_kpt
     
     @property
@@ -484,102 +495,91 @@ class InterpolativeSeparableDensityFitting(FFTDF):
 
     @property
     def eta_kpt(self):
-        if self._eta_kpt is None:
-            if self._isdf is not None:
-                self._eta_kpt = load(self._isdf, "eta_kpt")
-        assert self._eta_kpt is not None
-        return self._eta_kpt
+        assert self._base_eta_kpt is not None
+        return self._base_eta_kpt
 
     @property
     def metx_kpt(self):
-        if self._metx_kpt is None:
-            if self._isdf is not None:
-                self._metx_kpt = load(self._isdf, "metx_kpt")
-        assert self._metx_kpt is not None
-        return self._metx_kpt
+        assert self._base_metx_kpt is not None
+        return self._base_metx_kpt
 
     @property
     def kern_kpt(self):
-        if self._kern_kpt is None:
-            if self._isdf is not None:
-                self._kern_kpt = load(self._isdf, "kern_kpt")
-        assert self._kern_kpt is not None
-        return self._kern_kpt
+        assert self._base_kern_kpt is not None
+        return self._base_kern_kpt
 
-    def build(self, cisdf=10.0, reg=0.0):
+    def build(self, cisdf=10.0, reg=0.0, c=None):
         log = logger.new_logger(self, self.verbose)
         self.reg = reg
+        if c is not None:
+            c = numpy.asarray(c)
+        self.c = c
 
-        # If a pre-computed ISDF is available, load it
-        if self._isdf is not None:
+        # If a pre-computed ISDF is available, load the final tensors.
+        if self._isdf is not None and self._base_inpv_kpt is None:
             isdf_to_read = self._isdf
             assert os.path.exists(isdf_to_read)
 
             log.info("Loading ISDF results from %s, skipping build", isdf_to_read)
             inpv_kpt = load(isdf_to_read, "inpv_kpt")
-            try:
-                eta_kpt = load(isdf_to_read, "eta_kpt")
-                metx_kpt = load(isdf_to_read, "metx_kpt")
-                kern_kpt = load(isdf_to_read, "kern_kpt")
-            except KeyError:
-                log.info("Cached intermediates not found, rebuilding them")
-                eta_kpt = self.build_eta_kpt(inpv_kpt)
-                metx_kpt = self.build_metx_kpt(inpv_kpt)
-                kern_kpt = self.build_kern_kpt(inpv_kpt, eta_kpt)
-            coul_kpt = self.solve_coul_kpt(metx_kpt, kern_kpt, reg=reg)
+            coul_kpt = load(isdf_to_read, "coul_kpt")
             self._inpv_kpt = inpv_kpt
-            self._eta_kpt = eta_kpt
-            self._metx_kpt = metx_kpt
-            self._kern_kpt = kern_kpt
             self._coul_kpt = coul_kpt
+            self.c = None
             return inpv_kpt, coul_kpt
         
         self.check_sanity()
 
         # [Step 1]: compute the interpolating functions
         # inpv_kpt is a (nkpt, nip, nao) array
-        inpv_kpt = self._inpv_kpt
-        if inpv_kpt is not None:
+        base_inpv_kpt = self._base_inpv_kpt
+        if base_inpv_kpt is not None:
             log.debug("Using pre-computed interpolating vectors, c0 is not used")
         else:
-            inpv_kpt = self.build_inpv_kpt(cisdf=cisdf)
-            self._inpv_kpt = inpv_kpt
+            base_inpv_kpt = self.build_inpv_kpt(cisdf=cisdf)
+            self._base_inpv_kpt = base_inpv_kpt
+
+        if c is None:
+            inpv_kpt = base_inpv_kpt
+        else:
+            inpv_kpt = base_inpv_kpt * c[None, :, None]
+        self._inpv_kpt = inpv_kpt
 
         self.dump_flags()
         
         # [Step 2]: compute the right-hand side of the least-square fitting
         # eta_kpt is a (ngrid, nip, nkpt) array
-        eta_kpt = self._eta_kpt
+        eta_kpt = self._base_eta_kpt
         if eta_kpt is not None:
             log.debug("Using pre-computed eta_kpt")
         else:
             t0 = (process_clock(), perf_counter())
-            eta_kpt = self.build_eta_kpt(inpv_kpt)
-            self._eta_kpt = eta_kpt
+            eta_kpt = self.build_eta_kpt(base_inpv_kpt)
+            self._base_eta_kpt = eta_kpt
             log.timer("building eta_kpt", *t0)
 
-        metx_kpt = self._metx_kpt
+        metx_kpt = self._base_metx_kpt
         if metx_kpt is not None:
             log.debug("Using pre-computed metx_kpt")
         else:
             t0 = (process_clock(), perf_counter())
-            metx_kpt = self.build_metx_kpt(inpv_kpt)
-            self._metx_kpt = metx_kpt
+            metx_kpt = self.build_metx_kpt(base_inpv_kpt)
+            self._base_metx_kpt = metx_kpt
             log.timer("building metx_kpt", *t0)
 
-        kern_kpt = self._kern_kpt
+        kern_kpt = self._base_kern_kpt
         if kern_kpt is not None:
             log.debug("Using pre-computed kern_kpt")
         else:
             t0 = (process_clock(), perf_counter())
-            kern_kpt = self.build_kern_kpt(inpv_kpt, eta_kpt)
-            self._kern_kpt = kern_kpt
+            kern_kpt = self.build_kern_kpt(base_inpv_kpt, eta_kpt)
+            self._base_kern_kpt = kern_kpt
             log.timer("building kern_kpt", *t0)
 
         # [Step 3]: compute the Coulomb kernel,
         # coul_kpt is a (nkpt, nip, nip) array
         t0 = (process_clock(), perf_counter())
-        coul_kpt = self.solve_coul_kpt(metx_kpt, kern_kpt, reg=reg)
+        coul_kpt = self.solve_coul_kpt(metx_kpt, kern_kpt, reg=reg, c=c)
         log.timer("solving coul_kpt", *t0)
 
         # [Step 4]: save the results
@@ -591,28 +591,16 @@ class InterpolativeSeparableDensityFitting(FFTDF):
         log = logger.new_logger(self, self.verbose)
 
         inpv_kpt = self._inpv_kpt
-        eta_kpt = self._eta_kpt
-        metx_kpt = self._metx_kpt
-        kern_kpt = self._kern_kpt
         coul_kpt = self._coul_kpt
         assert inpv_kpt is not None
-        assert eta_kpt is not None
-        assert metx_kpt is not None
-        assert kern_kpt is not None
         assert coul_kpt is not None
 
         isdf_to_save = self._isdf_to_save
         if isdf_to_save is not None:
             self._isdf = isdf_to_save
-            eta_to_save = numpy.asarray(eta_kpt)
-            self._eta_kpt = eta_to_save
             dump(isdf_to_save, "inpv_kpt", inpv_kpt)
-            dump(isdf_to_save, "eta_kpt", eta_to_save)
-            dump(isdf_to_save, "metx_kpt", metx_kpt)
-            dump(isdf_to_save, "kern_kpt", kern_kpt)
             dump(isdf_to_save, "coul_kpt", coul_kpt)
-            nbytes = inpv_kpt.nbytes + eta_to_save.nbytes
-            nbytes += metx_kpt.nbytes + kern_kpt.nbytes + coul_kpt.nbytes
+            nbytes = inpv_kpt.nbytes + coul_kpt.nbytes
             log.info("ISDF results are saved to %s, size = %6.2e GB", isdf_to_save, nbytes / 1e9)
 
         if self._fswap is not None and isdf_to_save is not None:

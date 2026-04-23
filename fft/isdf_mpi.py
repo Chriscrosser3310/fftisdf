@@ -58,28 +58,16 @@ class WithMPI(fft.isdf.ISDF):
 
         if rank == 0:
             inpv_kpt = self._inpv_kpt
-            eta_kpt = self._eta_kpt
-            metx_kpt = self._metx_kpt
-            kern_kpt = self._kern_kpt
             coul_kpt = self._coul_kpt
             assert inpv_kpt is not None
-            assert eta_kpt is not None
-            assert metx_kpt is not None
-            assert kern_kpt is not None
             assert coul_kpt is not None
 
             isdf_to_save = self._isdf_to_save
             if isdf_to_save is not None:
                 self._isdf = isdf_to_save
-                eta_to_save = numpy.asarray(eta_kpt)
-                self._eta_kpt = eta_to_save
                 dump(isdf_to_save, "inpv_kpt", inpv_kpt)
-                dump(isdf_to_save, "eta_kpt", eta_to_save)
-                dump(isdf_to_save, "metx_kpt", metx_kpt)
-                dump(isdf_to_save, "kern_kpt", kern_kpt)
                 dump(isdf_to_save, "coul_kpt", coul_kpt)
-                nbytes = inpv_kpt.nbytes + eta_to_save.nbytes
-                nbytes += metx_kpt.nbytes + kern_kpt.nbytes + coul_kpt.nbytes
+                nbytes = inpv_kpt.nbytes + coul_kpt.nbytes
                 log.info("ISDF results are saved to %s, size = %6.2e GB", isdf_to_save, nbytes / 1e9)
 
         comm.barrier()

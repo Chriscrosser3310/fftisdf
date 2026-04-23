@@ -3,6 +3,7 @@ import signal
 signal.signal(signal.SIGINT, signal.SIG_DFL)
 
 import numpy as np
+import torch
 from pyscf.pbc import gto, scf, df
 
 import fft
@@ -58,7 +59,7 @@ Cocc = np.array(C[:, :, o], order="C", copy=True)
 Cvir = np.array(C[:, :, v], order="C", copy=True)
 nvir = Cvir.shape[2]
 
-cisdf = 10.0
+cisdf = 20.0
 
 print("")
 print("cell.ke_cutoff =", cell.ke_cutoff)
@@ -92,7 +93,8 @@ eri_ovov_7d_isdf_ao = isdf_ao.ao2mo_7d(C_ovov, kpts=kpts)
 eri_ovvo_7d_isdf_ao = isdf_ao.ao2mo_7d(C_ovvo, kpts=kpts)
 diff_isdf_ao_ovov = np.linalg.norm(eri_ovov_7d_isdf_ao - eri_ovov_7d_fft) / norm_ovov_7d_fft
 diff_isdf_ao_ovvo = np.linalg.norm(eri_ovvo_7d_isdf_ao - eri_ovvo_7d_fft) / norm_ovvo_7d_fft
-print('X norm', np.linalg.svd(isdf_ao.inpv_kpt)[1].max())
+print('Xo norm', np.linalg.svd(isdf_ao.inpv_kpt @ Cocc)[1].max())
+print('Xv norm', np.linalg.svd(isdf_ao.inpv_kpt @ Cvir)[1].max())
 print()
 print("ovov ||ISDF(AO) - FFTDF|| / ||FFTDF|| = %16.8e" % diff_isdf_ao_ovov, flush=True)
 print("ovvo ||ISDF(AO) - FFTDF|| / ||FFTDF|| = %16.8e" % diff_isdf_ao_ovvo, flush=True)
@@ -103,7 +105,7 @@ print()
 
 isdf_ov = fft.ISDF(cell, kpts, ov=(Cocc, Cvir))
 isdf_ov.verbose = 0
-for reg in [0, 1e-10, 1e-9, 1e-8, 1e-7, 1e-6]:
+for reg in [0, 1e-12, 1e-11, 1e-10, 1e-9, 1e-8, 1e-7, 1e-6]:
     isdf_ov.build(cisdf=cisdf, reg=reg)
     eri_ovov_7d_isdf_ov = isdf_ov.ao2mo_7d(C_ovov, kpts=kpts)
     eri_ovvo_7d_isdf_ov = isdf_ov.ao2mo_7d(C_ovvo, kpts=kpts)
@@ -111,7 +113,7 @@ for reg in [0, 1e-10, 1e-9, 1e-8, 1e-7, 1e-6]:
     diff_isdf_ov_ovvo = np.linalg.norm(eri_ovvo_7d_isdf_ov - eri_ovvo_7d_fft) / norm_ovvo_7d_fft
     print(f"ovov ||ISDF(OV, {str(reg):6s}) - FFTDF|| / ||FFTDF|| = %16.8e" % diff_isdf_ov_ovov, flush=True)
     print(f"ovvo ||ISDF(OV, {str(reg):6s}) - FFTDF|| / ||FFTDF|| = %16.8e" % diff_isdf_ov_ovvo, flush=True)
-    print(f'ISDF(OV, {str(reg):6s}) Coulomb norm', np.linalg.svd(isdf_ov.coul_kpt)[1].max() / nkpts)
+    print(f'ISDF(OV, {str(reg):6s}) Coulomb norm', np.abs(np.linalg.eigvalsh(isdf_ov.coul_kpt)[1]).max() / nkpts)
     emp2_isdf_ov = utils.mp2_from_ovov_7d(eri_ovov_7d_isdf_ov, mf.mo_energy, nocc, kpts_int, kmesh)
     print(f"ISDF(OV, {str(reg):6s}) MP2: E = %16.8e" % emp2_isdf_ov, flush=True)
     print()
