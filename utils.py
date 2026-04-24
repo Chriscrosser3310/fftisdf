@@ -7,7 +7,23 @@ has_profile = hasattr(builtins, 'profile')
 if not has_profile:
     profile = lambda x: x
 
-profile_enabled = False
+enable_profile = False
+use_fast_fft = False
+
+
+def enable_fast_fft():
+    global use_fast_fft
+    use_fast_fft = True
+
+
+def disable_fast_fft():
+    global use_fast_fft
+    use_fast_fft = False
+
+
+def synchronize():
+    if enable_profile:
+        torch.cuda.synchronize()
 
 
 def modify_signature(func, args_to_add, args_to_delete, **kwargs):
@@ -28,22 +44,12 @@ def modify_signature(func, args_to_add, args_to_delete, **kwargs):
     return decorator
 
 
-def enable_profile():
-    global profile_enabled
-    profile_enabled = True
-
-
-def disable_profile():
-    global profile_enabled
-    profile_enabled = False
-
-
 def maybe_profile(func):
     func_profile = profile(func)
 
     @modify_signature(func, [], [])
     def newfunc(*args, **kwargs):
-        if profile_enabled:
+        if enable_profile:
             return func_profile(*args, **kwargs)
         else:
             return func(*args, **kwargs)
@@ -76,20 +82,50 @@ def c_loss_2_norm(logc, X_t, W_t):
 
 
 @maybe_profile
-def thc_ovvo_build_Lbar(Xo_A, Xv_A, Xo_B, Xv_B, kconserv2):
-    nkpts, naux = Xo_A.shape[:2]
-    if not torch.is_tensor(kconserv2):
-        kconserv2 = torch.as_tensor(kconserv2, dtype=torch.long, device=Xo_A.device)
-    else:
-        kconserv2 = kconserv2.to(device=Xo_A.device, dtype=torch.long)
+def thc_ovvo_build_Lbar(Xo_A, Xv_A, Xo_B, Xv_B, kmesh):
+    nkpts, naux_A = Xo_A.shape[:2]
+    naux_B = Xo_B.shape[1]
+    kmesh = tuple(int(x) for x in kmesh)
+    assert nkpts == int(np.prod(kmesh))
 
     O = torch.einsum("pIi,pKi->pIK", Xo_A, Xo_B.conj())
     V = torch.einsum("qIa,qKa->qIK", Xv_A.conj(), Xv_B)
 
-    s_index = kconserv2.reshape(-1)
-    Lpq = O[:, None] * V[None, :]
-    Lbar = torch.zeros((nkpts, naux, naux), dtype=Xo_A.dtype, device=Xo_A.device)
-    return Lbar.index_add(0, s_index, Lpq.reshape(nkpts * nkpts, naux, naux))
+    O = O.reshape(*kmesh, naux_A, naux_B)
+    V = V.reshape(*kmesh, naux_A, naux_B)
+
+    if use_fast_fft:
+        O_fft = torch.fft.fftn(O, dim=tuple(range(len(kmesh))))
+        V_fft = torch.fft.fftn(V, dim=tuple(range(len(kmesh))))
+    else:
+        for axis, n in enumerate(kmesh):
+            j = torch.arange(n, device=O.device, dtype=torch.float64)
+            phase = torch.exp((-2j * np.pi / n) * (j[:, None] * j[None, :])).to(dtype=O.dtype)
+
+            shape = O.shape
+            O = O.movedim(axis, 0)
+            O = (phase @ O.reshape(n, -1)).reshape(O.shape).movedim(0, axis)
+
+            V = V.movedim(axis, 0)
+            V = (phase @ V.reshape(n, -1)).reshape(V.shape).movedim(0, axis)
+        O_fft = O
+        V_fft = V
+
+    for axis, n in enumerate(kmesh):
+        idx = (-torch.arange(n, device=O_fft.device)) % n
+        O_fft = O_fft.index_select(axis, idx)
+
+    Lbar = O_fft * V_fft
+    if use_fast_fft:
+        Lbar = torch.fft.ifftn(Lbar, dim=tuple(range(len(kmesh))))
+    else:
+        for axis, n in enumerate(kmesh):
+            j = torch.arange(n, device=Lbar.device, dtype=torch.float64)
+            phase = torch.exp((2j * np.pi / n) * (j[:, None] * j[None, :])).to(dtype=Lbar.dtype) / n
+            Lbar = Lbar.movedim(axis, 0)
+            Lbar = (phase @ Lbar.reshape(n, -1)).reshape(Lbar.shape).movedim(0, axis)
+
+    return Lbar.reshape(nkpts, naux_A, naux_B)
 
 
 @maybe_profile
@@ -113,70 +149,80 @@ def torch_lstsq_oinv(a, b, reg=None):
     dtype = a.dtype
     a = a.to(dtype=torch.complex128)
     b = b.to(dtype=torch.complex128)
+    synchronize()
     if reg is not None:
-        reg = reg.to(dtype=torch.float64)
+        reg = torch.as_tensor(reg, device=a.device, dtype=torch.float64)
     if a.ndim == 3:
         if reg is None:
             x = torch.linalg.solve(a, b)
             result = torch.linalg.solve(a.transpose(-1, -2), x.transpose(-1, -2)).transpose(-1, -2)
-
-        eye = torch.eye(a.shape[-1], dtype=a.dtype, device=a.device)
-        ah = a.conj().transpose(-1, -2)
-        o = ah @ a + reg * eye
-        rhs = ah @ b @ a
-        x = torch.linalg.solve(o, rhs)
-        result = torch.linalg.solve(o.transpose(-1, -2), x.transpose(-1, -2)).transpose(-1, -2)
+        else:
+            eye = torch.eye(a.shape[-1], dtype=a.dtype, device=a.device)
+            ah = a.conj().transpose(-1, -2)
+            o = ah @ a + reg * eye
+            rhs = ah @ b @ a
+            synchronize()
+            x = torch.linalg.solve(o, rhs)
+            synchronize()
+            result = torch.linalg.solve(o.transpose(-1, -2), x.transpose(-1, -2)).transpose(-1, -2)
+            synchronize()
     else:
         if reg is None:
             result = torch.linalg.solve(a.T, torch.linalg.solve(a, b).T).T
-
-        eye = torch.eye(a.shape[0], dtype=a.dtype, device=a.device)
-        ah = a.conj().T
-        o = ah @ a + reg * eye
-        rhs = ah @ b @ a
-        result = torch.linalg.solve(o.T, torch.linalg.solve(o, rhs).T).T
+        else:
+            eye = torch.eye(a.shape[0], dtype=a.dtype, device=a.device)
+            ah = a.conj().T
+            o = ah @ a + reg * eye
+            rhs = ah @ b @ a
+            result = torch.linalg.solve(o.T, torch.linalg.solve(o, rhs).T).T
     return result.to(dtype=dtype)
 
 
 @maybe_profile
-def thc_ovvo_solve_w_from_mo(Xo_ref, Xv_ref, W_ref, Xo, Xv, kconserv2, reg=None):
-    L_ref = thc_ovvo_build_Lbar(Xo_ref, Xv_ref, Xo, Xv, kconserv2)
-    L = thc_ovvo_build_Lbar(Xo, Xv, Xo, Xv, kconserv2)
+def thc_ovvo_solve_w_from_mo(Xo_ref, Xv_ref, W_ref, Xo, Xv, kmesh, reg=None):
+    L_ref = thc_ovvo_build_Lbar(Xo_ref, Xv_ref, Xo, Xv, kmesh)
+    L = thc_ovvo_build_Lbar(Xo, Xv, Xo, Xv, kmesh)
     rhs = (L_ref.transpose(-1, -2) @ W_ref.conj() @ L_ref.conj()).conj()
     return torch_lstsq_oinv(L, rhs, reg=reg)
 
 
 @maybe_profile
-def thc_ovvo_solve_w_error2_from_mo(Xo_ref, Xv_ref, W_ref, Xo, Xv, kconserv2, ref_norm2, reg=None):
-    L_ref = thc_ovvo_build_Lbar(Xo_ref, Xv_ref, Xo, Xv, kconserv2)
-    L = thc_ovvo_build_Lbar(Xo, Xv, Xo, Xv, kconserv2)
+def thc_ovvo_solve_w_error2_from_mo(Xo_ref, Xv_ref, W_ref, Xo, Xv, kmesh, ref_norm2, reg=None):
+    L_ref = thc_ovvo_build_Lbar(Xo_ref, Xv_ref, Xo, Xv, kmesh)
+    synchronize()
+    L = thc_ovvo_build_Lbar(Xo, Xv, Xo, Xv, kmesh)
+    synchronize()
     rhs = (L_ref.transpose(-1, -2) @ W_ref.conj() @ L_ref.conj()).conj()
+    synchronize()
     W = torch_lstsq_oinv(L, rhs, reg=reg)
+    synchronize()
 
-    ab = torch.einsum("sKL,sKL->", W.conj(), rhs).real
-    bb = torch.einsum("sIJ,sKL,sIK,sJL->", W.conj(), W, L, L.conj()).real
+    ab = ((W.conj().transpose(-1, -2) @ rhs).diagonal(dim1=-1, dim2=-2).sum()).real
+    synchronize()
+    bb = ((W.conj().transpose(-1, -2) @ L @ W @ L.conj().transpose(-1, -2)).diagonal(dim1=-1, dim2=-2).sum()).real
+    synchronize()
     error2 = (ref_norm2 + bb - 2.0 * ab).real
     return W, error2
 
 
 @maybe_profile
-def thc_ovvo_inner_from_mo(Xo_A, Xv_A, W_A, Xo_B, Xv_B, W_B, kconserv2):
-    Lbar = thc_ovvo_build_Lbar(Xo_A, Xv_A, Xo_B, Xv_B, kconserv2)
-    return torch.einsum(
-        "sIJ,sKL,sIK,sJL->",
-        W_A.conj(),
-        W_B,
-        Lbar,
-        Lbar.conj(),
-    )
+def thc_ovvo_inner_from_mo(Xo_A, Xv_A, W_A, Xo_B, Xv_B, W_B, kmesh):
+    Lbar = thc_ovvo_build_Lbar(Xo_A, Xv_A, Xo_B, Xv_B, kmesh)
+    return (W_A.conj().transpose(-1, -2) @ Lbar @ W_B @ Lbar.conj().transpose(-1, -2)).diagonal(dim1=-1, dim2=-2).sum()
 
 
 @maybe_profile
-def thc_ovvo_error2_from_mo(Xo_A, Xv_A, W_A, Xo_B, Xv_B, W_B, kconserv2):
-    aa = thc_ovvo_inner_from_mo(Xo_A, Xv_A, W_A, Xo_A, Xv_A, W_A, kconserv2)
-    bb = thc_ovvo_inner_from_mo(Xo_B, Xv_B, W_B, Xo_B, Xv_B, W_B, kconserv2)
-    ab = thc_ovvo_inner_from_mo(Xo_A, Xv_A, W_A, Xo_B, Xv_B, W_B, kconserv2)
+def thc_ovvo_error2_from_mo(Xo_A, Xv_A, W_A, Xo_B, Xv_B, W_B, kmesh):
+    aa = thc_ovvo_inner_from_mo(Xo_A, Xv_A, W_A, Xo_A, Xv_A, W_A, kmesh)
+    bb = thc_ovvo_inner_from_mo(Xo_B, Xv_B, W_B, Xo_B, Xv_B, W_B, kmesh)
+    ab = thc_ovvo_inner_from_mo(Xo_A, Xv_A, W_A, Xo_B, Xv_B, W_B, kmesh)
     return (aa + bb - 2.0 * ab.real).real
+
+
+def is_k_ordered(kpts_int, kmesh):
+    A = np.moveaxis(np.stack(np.meshgrid(*[np.arange(n) for n in kmesh], indexing='ij'), axis=0), 0, -1)
+    B = kpts_int.reshape(tuple(kmesh) + (len(kmesh),))
+    return np.all(A == B)
 
 
 def eri7d_to_full(tensor_7d, kpts_int, kmesh):
@@ -251,3 +297,83 @@ def mp2_from_ovov_full(eri_ovov_full, mo_energy, nocc):
     ).real / nkpts
     return emp2
 
+
+def compare_two_isdf(isdf_ref, isdf, Cocc, Cvir, kmesh):
+    X_ref = torch.from_numpy(np.asarray(isdf_ref.inpv_kpt)).to(dtype=torch.complex128)
+    W_ref = torch.from_numpy(np.asarray(isdf_ref.coul_kpt)).to(dtype=torch.complex128)
+    X = torch.from_numpy(np.asarray(isdf.inpv_kpt)).to(dtype=torch.complex128)
+    W = torch.from_numpy(np.asarray(isdf.coul_kpt)).to(dtype=torch.complex128)
+    Cocc_t = torch.from_numpy(np.asarray(Cocc)).to(dtype=torch.complex128)
+    Cvir_t = torch.from_numpy(np.asarray(Cvir)).to(dtype=torch.complex128)
+
+    Xo_ref, Xv_ref = X_ref @ Cocc_t, X_ref @ Cvir_t
+    Xo, Xv = X @ Cocc_t, X @ Cvir_t
+    ref_norm2 = thc_ovvo_inner_from_mo(
+        Xo_ref, Xv_ref, W_ref,
+        Xo_ref, Xv_ref, W_ref,
+        kmesh,
+    ).real
+    error2 = thc_ovvo_error2_from_mo(
+        Xo_ref, Xv_ref, W_ref,
+        Xo, Xv, W,
+        kmesh,
+    ).real
+    return torch.sqrt(error2 / ref_norm2).item()
+
+
+def stochastic_eri_diff(df1, df2, mo_coeff_kpts, nsamples):
+    from pyscf.pbc import tools as pbctools
+
+    kpts = np.asarray(df1.kpts)
+    assert np.allclose(kpts, np.asarray(df2.kpts))
+
+    kmesh = pbctools.k2gamma.kpts_to_kmesh(df1.cell, kpts - kpts[0])
+    kmesh = np.asarray(kmesh, dtype=int)
+    kpts_int = np.round(df1.cell.get_scaled_kpts(kpts) * kmesh).astype(int) % kmesh
+    assert is_k_ordered(kpts_int, kmesh)
+
+    if isinstance(mo_coeff_kpts, np.ndarray) and mo_coeff_kpts.ndim == 3:
+        mo_coeff_kpts = [mo_coeff_kpts, ] * 4
+    else:
+        mo_coeff_kpts = list(mo_coeff_kpts)
+    assert len(mo_coeff_kpts) == 4
+
+    kpt_map = {tuple(k): i for i, k in enumerate(kpts_int)}
+    nkpts = len(kpts)
+    rng = np.random.default_rng()
+
+    diff2 = np.empty(nsamples, dtype=np.float64)
+    ref2 = np.empty(nsamples, dtype=np.float64)
+    import tqdm
+    for isample in tqdm.tqdm(range(nsamples)):
+        k1, k2, k3 = rng.integers(0, nkpts, size=3)
+        k4_int = (kpts_int[k1] - kpts_int[k2] + kpts_int[k3]) % kmesh
+        k4 = kpt_map[tuple(k4_int)]
+        kpts4 = kpts[[k1, k2, k3, k4]]
+        mo_coeff_sample = []
+        for mo, ki in zip(mo_coeff_kpts, (k1, k2, k3, k4)):
+            mo_coeff_sample.append(mo[ki])
+
+        eri1 = df1.ao2mo(mo_coeff_sample, kpts=kpts4).flatten()
+        eri2 = df2.ao2mo(mo_coeff_sample, kpts=kpts4).flatten()
+        diff2[isample] = np.linalg.norm(eri1 - eri2)**2
+        ref2[isample] = np.linalg.norm(eri1)**2
+
+    diff_mean = diff2.mean()
+    ref_mean = ref2.mean()
+    rel_diff = float(np.sqrt(diff_mean / ref_mean))
+
+    if nsamples > 1:
+        cov = np.cov(np.vstack((diff2, ref2)), ddof=1) / nsamples
+        drel_ddiff = 0.5 / np.sqrt(diff_mean * ref_mean)
+        drel_dref = -0.5 * np.sqrt(diff_mean) / (ref_mean ** 1.5)
+        rel_var = (
+            drel_ddiff * drel_ddiff * cov[0, 0]
+            + drel_dref * drel_dref * cov[1, 1]
+            + 2.0 * drel_ddiff * drel_dref * cov[0, 1]
+        )
+        rel_std = float(np.sqrt(max(rel_var, 0.0)))
+    else:
+        rel_std = 0.0
+
+    return rel_diff, rel_std

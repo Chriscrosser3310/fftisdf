@@ -459,7 +459,7 @@ class InterpolativeSeparableDensityFitting(FFTDF):
             coul_q = (coul_q + coul_q.conj().T) / 2
             if log.verbose >= logger.DEBUG1:
                 err = metx_q @ coul_q @ metx_q - kern_q
-                err = abs(err).max() / abs(kern_q).max()
+                err = numpy.linalg.norm(err) / numpy.linalg.norm(kern_q)
                 log.debug("\nMetric tensor rank: %d / %d, lstsq error: %6.2e", res[1], nip, err)
 
             coul_kpt[q] = coul_q
@@ -526,6 +526,12 @@ class InterpolativeSeparableDensityFitting(FFTDF):
             self._inpv_kpt = inpv_kpt
             self._coul_kpt = coul_kpt
             self.c = None
+            if self._fswap is not None:
+                fswap = self._fswap.filename
+                self._fswap.close()
+                self._fswap = None
+                if os.path.exists(fswap):
+                    os.remove(fswap)
             return inpv_kpt, coul_kpt
         
         self.check_sanity()
@@ -603,14 +609,14 @@ class InterpolativeSeparableDensityFitting(FFTDF):
             nbytes = inpv_kpt.nbytes + coul_kpt.nbytes
             log.info("ISDF results are saved to %s, size = %6.2e GB", isdf_to_save, nbytes / 1e9)
 
-        if self._fswap is not None and isdf_to_save is not None:
+        if self._fswap is not None:
             fswap = self._fswap.filename
             self._fswap.close()
             self._fswap = None
 
             if os.path.exists(fswap):
                 os.remove(fswap)
-            
+
             assert not os.path.exists(fswap)
             log.debug("Successfully removed swap file %s", fswap)
 
