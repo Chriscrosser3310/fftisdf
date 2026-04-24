@@ -7,12 +7,12 @@ import numpy as np
 
 import fft
 import utils
-fft.isdf.CHOLESKY_MAX_SIZE = 20000
+fft.isdf.CHOLESKY_MAX_SIZE = 12000
 
+nk = int(sys.argv[1])
 basis = "gth-dzvp"
 ke_cutoff = 40.0
-#kmesh = np.array([2, 2, 2])
-kmesh = np.array([3, 3, 3])
+kmesh = np.array([nk, nk, nk])
 klabel = f"{kmesh[0]}x{kmesh[1]}x{kmesh[2]}"
 
 scf_pkl = f"data/SCF_diamond_{klabel}_{basis}_ke{ke_cutoff}.pkl"
@@ -23,11 +23,6 @@ cell = mf.cell
 kpts = cell.make_kpts(kmesh)
 kpts_int = np.round(cell.get_scaled_kpts(kpts) * kmesh).astype(int) % kmesh
 assert utils.is_k_ordered(kpts_int, kmesh)
-
-#from pyscf.pbc.mp import kmp2
-#mp = kmp2.KMP2(mf)
-#emp2_pyscf, t2_pyscf = mp.kernel(with_t2=False)
-#print("PySCF KMP2: E = %16.8e" % emp2_pyscf)
 
 C = np.asarray(mf.mo_coeff)
 nkpts, nao, nmo = C.shape
