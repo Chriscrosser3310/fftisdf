@@ -150,8 +150,6 @@ def torch_lstsq_oinv(a, b, reg=None):
     a = a.to(dtype=torch.complex128)
     b = b.to(dtype=torch.complex128)
     synchronize()
-    if reg is not None:
-        reg = torch.as_tensor(reg, device=a.device, dtype=torch.float64)
     if a.ndim == 3:
         if reg is None:
             x = torch.linalg.solve(a, b)
@@ -159,7 +157,7 @@ def torch_lstsq_oinv(a, b, reg=None):
         else:
             eye = torch.eye(a.shape[-1], dtype=a.dtype, device=a.device)
             ah = a.conj().transpose(-1, -2)
-            o = ah @ a + reg * eye
+            o = ah @ a + reg**2 * eye
             rhs = ah @ b @ a
             synchronize()
             x = torch.linalg.solve(o, rhs)
@@ -172,9 +170,26 @@ def torch_lstsq_oinv(a, b, reg=None):
         else:
             eye = torch.eye(a.shape[0], dtype=a.dtype, device=a.device)
             ah = a.conj().T
-            o = ah @ a + reg * eye
+            o = ah @ a + reg**2 * eye
             rhs = ah @ b @ a
             result = torch.linalg.solve(o.T, torch.linalg.solve(o, rhs).T).T
+    return result.to(dtype=dtype)
+
+
+@maybe_profile
+def torch_lstsq_oinv_PSD(a, b, reg=None):
+    dtype = a.dtype
+    a = a.to(dtype=torch.complex128)
+    b = b.to(dtype=torch.complex128)
+    if reg is not None:
+        a = a + reg * torch.eye(a.shape[-1], dtype=a.dtype, device=a.device)
+    synchronize()
+    if a.ndim == 3:
+        x = torch.linalg.solve(a, b)
+        result = torch.linalg.solve(a.transpose(-1, -2), x.transpose(-1, -2)).transpose(-1, -2)
+    else:
+        result = torch.linalg.solve(a.T, torch.linalg.solve(a, b).T).T
+    synchronize()
     return result.to(dtype=dtype)
 
 
@@ -183,7 +198,7 @@ def thc_ovvo_solve_w_from_mo(Xo_ref, Xv_ref, W_ref, Xo, Xv, kmesh, reg=None):
     L_ref = thc_ovvo_build_Lbar(Xo_ref, Xv_ref, Xo, Xv, kmesh)
     L = thc_ovvo_build_Lbar(Xo, Xv, Xo, Xv, kmesh)
     rhs = (L_ref.transpose(-1, -2) @ W_ref.conj() @ L_ref.conj()).conj()
-    return torch_lstsq_oinv(L, rhs, reg=reg)
+    return torch_lstsq_oinv_PSD(L, rhs, reg=reg)
 
 
 @maybe_profile
@@ -194,7 +209,7 @@ def thc_ovvo_solve_w_error2_from_mo(Xo_ref, Xv_ref, W_ref, Xo, Xv, kmesh, ref_no
     synchronize()
     rhs = (L_ref.transpose(-1, -2) @ W_ref.conj() @ L_ref.conj()).conj()
     synchronize()
-    W = torch_lstsq_oinv(L, rhs, reg=reg)
+    W = torch_lstsq_oinv_PSD(L, rhs, reg=reg)
     synchronize()
 
     ab = ((W.conj().transpose(-1, -2) @ rhs).diagonal(dim1=-1, dim2=-2).sum()).real
