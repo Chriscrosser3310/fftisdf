@@ -13,9 +13,9 @@ from pyscf.lib.logger import process_clock, perf_counter
 from pyscf.pbc import tools as pbctools
 
 import fft
-from fft.isdf import contract, lstsq
+from fft.isdf import contract, contract_pair, lstsq
 from fft.isdf import get_phase_factor
-from fft.isdf import compute_blksize
+from fft.isdf import compute_blksize, project_ov
 
 from pyscf import __config__
 from pyscf.pbc.dft.gen_grid import BLKSIZE
@@ -24,8 +24,11 @@ CHOLESKY_MAX_SIZE = getattr(__config__, "fftisdf_cholesky_max_size", 20000)
 CONTRACT_MAX_SIZE = getattr(__config__, "fftisdf_contract_max_size", 20000)
 
 class WithMPI(fft.isdf.ISDF):
-    def __init__(self, cell, kpts, comm=None):
-        super().__init__(cell, kpts)
+    def __init__(self, cell, kpts, ov=None, comm=None):
+        if comm is None and hasattr(ov, "Get_rank"):
+            comm = ov
+            ov = None
+        super().__init__(cell, kpts, ov=ov)
         if comm is None:
             from mpi4py import MPI
             comm = MPI.COMM_WORLD
@@ -53,20 +56,7 @@ class WithMPI(fft.isdf.ISDF):
         rank = comm.Get_rank()
         comm.barrier()
 
-        if self._fswap is not None:
-            fswap = self._fswap.filename
-            self._fswap.close()
-            self._fswap = None
-
-        comm.barrier()
-
         if rank == 0:
-            if os.path.exists(fswap):
-                os.remove(fswap)
-
-            assert not os.path.exists(fswap)
-            log.debug("Successfully removed swap file %s", fswap)
-
             inpv_kpt = self._inpv_kpt
             coul_kpt = self._coul_kpt
             assert inpv_kpt is not None
@@ -79,6 +69,22 @@ class WithMPI(fft.isdf.ISDF):
                 dump(isdf_to_save, "coul_kpt", coul_kpt)
                 nbytes = inpv_kpt.nbytes + coul_kpt.nbytes
                 log.info("ISDF results are saved to %s, size = %6.2e GB", isdf_to_save, nbytes / 1e9)
+
+        comm.barrier()
+
+        isdf_to_save = self._isdf_to_save
+        if self._fswap is not None and isdf_to_save is not None:
+            fswap = self._fswap.filename
+            self._fswap.close()
+            self._fswap = None
+
+            comm.barrier()
+            if rank == 0:
+                if os.path.exists(fswap):
+                    os.remove(fswap)
+
+                assert not os.path.exists(fswap)
+                log.debug("Successfully removed swap file %s", fswap)
 
         comm.barrier()
 
@@ -99,6 +105,8 @@ class WithMPI(fft.isdf.ISDF):
         grids = self.grids
         ngrid = grids.coords.shape[0]
         nkpt, nip, nao = inpv_kpt.shape
+        if self.ov is not None:
+            inpv_occ_kpt, inpv_vir_kpt = project_ov(self, inpv_kpt)
 
         blksize_max = int(max_memory * 1e6 * 0.2) // (nkpt * nip * 16)
         blksize_max = max(BLKSIZE, blksize_max)
@@ -130,7 +138,15 @@ class WithMPI(fft.isdf.ISDF):
                 continue
             ao_kpt = numpy.asarray(ao_etc_kpt[0], dtype=numpy.complex128)
 
-            eta_kpt_g0g1 = contract(inpv_kpt, ao_kpt, phase)
+            if self.ov is None:
+                eta_kpt_g0g1 = contract(inpv_kpt, ao_kpt, phase)
+            else:
+                ao_occ_kpt, ao_vir_kpt = project_ov(self, ao_kpt)
+                eta_kpt_g0g1 = contract_pair(
+                    inpv_occ_kpt, ao_occ_kpt,
+                    inpv_vir_kpt, ao_vir_kpt,
+                    phase,
+                )
             eta_kpt_g0g1 = eta_kpt_g0g1.reshape(nkpt * nip, g1 - g0)
 
             eta_kpt[:, g0:g1] = eta_kpt_g0g1
@@ -141,7 +157,7 @@ class WithMPI(fft.isdf.ISDF):
         comm.barrier()
         return eta_kpt
 
-    def build_coul_kpt(self, inpv_kpt, eta_kpt):
+    def build_kern_kpt(self, inpv_kpt, eta_kpt):
         comm = self._comm
         comm.barrier()
 
@@ -149,11 +165,9 @@ class WithMPI(fft.isdf.ISDF):
         size = comm.Get_size()
 
         log = logger.new_logger(self, self.verbose)
-        tol = self.tol
 
         cell = self.cell
         kpts = self.kpts
-        phase = get_phase_factor(cell, kpts)
 
         mesh = cell.mesh
         v0 = cell.get_Gv(mesh)
@@ -163,18 +177,17 @@ class WithMPI(fft.isdf.ISDF):
         ngrid = coord.shape[0]
 
         nkpt, nip, nao = inpv_kpt.shape
-        metx_kpt = contract(inpv_kpt, inpv_kpt, phase)
         comm.barrier()
 
         fswap = self._fswap
         shape = (nkpt, nip, nip)
         chunk = (1, nip, nip)
         dtype = numpy.complex128
-        coul_kpt = fswap.create_dataset("coul_kpt", shape=shape, dtype=dtype, chunks=chunk)
+        kern_kpt = fswap.create_dataset("kern_kpt", shape=shape, dtype=dtype, chunks=chunk)
         comm.barrier()
 
-        log.debug("\nComputing coul_kpt")
-        info = (lambda s: f"coul_kpt[ %{len(s)}d / {s}]")(str(nkpt))
+        log.debug("\nComputing kern_kpt")
+        info = (lambda s: f"kern_kpt[ %{len(s)}d / {s}]")(str(nkpt))
         for q in range(nkpt):
             t0 = (process_clock(), perf_counter())
             q0, q1 = q * nip, (q + 1) * nip
@@ -193,24 +206,14 @@ class WithMPI(fft.isdf.ISDF):
             kern_q = lib.dot(lq, rq.T) / numpy.sqrt(ngrid)
             lq = rq = wq = None
 
-            metx_q = metx_kpt[q]
-            res = lstsq(metx_q, kern_q, tol=tol)
-            coul_q = res[0]
-            coul_q = (coul_q + coul_q.conj().T) / 2
-            if log.verbose >= logger.DEBUG1:
-                err = metx_q @ coul_q @ metx_q - kern_q
-                err = abs(err).max() / abs(kern_q).max()
-                log.debug("\nMetric tensor rank: %d / %d, lstsq error: %6.2e", res[1], nip, err)
-                
-            coul_kpt[q] = coul_q * numpy.sqrt(ngrid)
-            coul_q = None
+            kern_kpt[q] = kern_q * numpy.sqrt(ngrid)
 
             log.timer(info % (q + 1), *t0)
 
         comm.barrier()
-        coul_kpt = fswap["coul_kpt"][:]
+        kern_kpt = fswap["kern_kpt"][:]
         comm.barrier()
 
-        return coul_kpt
+        return kern_kpt
 
 FFTISDF = ISDF = WithMPI
